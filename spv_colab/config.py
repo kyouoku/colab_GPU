@@ -233,9 +233,11 @@ def derive_params(user_cfg=None, verbose=True):
 
     if verbose:
         if res_harminv > RES_MAX:
-            print(f"[警告] 粗探索解像度 res_harminv={res_harminv} が上限 RES_MAX={RES_MAX} を超えています。")
+            print(f"[警告] 粗探索解像度 res_harminv={res_harminv} が上限 RES_MAX={RES_MAX} を超えているため {RES_MAX} に制限します。")
         if res_mode > RES_MAX:
-            print(f"[警告] 本計算解像度 res_mode={res_mode} が上限 RES_MAX={RES_MAX} を超えています。")
+            print(f"[警告] 本計算解像度 res_mode={res_mode} が上限 RES_MAX={RES_MAX} を超えているため {RES_MAX} に制限します。")
+    res_harminv = min(res_harminv, RES_MAX)
+    res_mode = min(res_mode, RES_MAX)
 
     # 2. 波源中心周波数 fcen, 帯域幅 df, cutoff
     fcen = 0.5 * (f_min + f_max)

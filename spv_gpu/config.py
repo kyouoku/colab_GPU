@@ -157,9 +157,9 @@ DEFAULT_CFG: Dict[str, Any] = {
 
 DEFAULT_BACKEND: Dict[str, Any] = {
     "dtype": "float32",  # 'float32' (既定) | 'bfloat16'
-    "max_gpu_mem_frac": 0.9,  # 推定メモリがこれを超えたら res を引き下げ/警告
+    "max_gpu_mem_frac": 0.70,  # BFCアロケータの断片化・XLA中間バッファ余力を確保するため既定70%
     "x64_refine": False,  # 高Qモードの補正だけ float64 を選べるようにする
-    "chunk_steps": 2000,  # lax.scan の1チャンクあたりステップ数
+    "chunk_steps": 1000,  # lax.scan の1チャンクあたりステップ数
     "subpixel_n": 4,  # 4x4x4 サブピクセル体積分率平均
     "anisotropic_averaging": False,
 }
@@ -273,14 +273,14 @@ def estimate_gpu_memory_gb(
     nx: int, ny: int, nz: int, dtype: str = "float32", n_dft_freqs: int = 0
 ) -> float:
     """
-    グリッドサイズ (Nx, Ny, Nz) から FDTDX 実行時の推定 GPU メモリ使用量 [GB] を算出する。
-    仕様書B1 §5:
-      mem_bytes = Nx * Ny * Nz * bytes_per_elem * 16 (E, H, inv_eps, PML補助場, JIT中間バッファ)
+    グリッドサイズ (Nx, Ny, Nz) から FDTDX + XLA lax.scan 実行時のピーク GPU メモリ使用量 [GB] を算出する。
+    E(3), H(3), inv_eps(1-3), PML補助場 psi(18), curl/roll中間テンソルおよびXLAダブルバッファを考慮し、
+    1セルあたり 64 要素分で安全側に見積もる。
     """
     bytes_per_elem = 2 if dtype == "bfloat16" else (8 if dtype == "float64" else 4)
-    base_bytes = float(nx) * float(ny) * float(nz) * bytes_per_elem * 16.0
+    base_bytes = float(nx) * float(ny) * float(nz) * bytes_per_elem * 64.0
     slice_elems = (nx * ny * 2 + nx * nz + ny * nz) * 6 * max(1, n_dft_freqs)
-    dft_bytes = slice_elems * 8.0
+    dft_bytes = slice_elems * 8.0 * 2.0
     return (base_bytes + dft_bytes) / (1024.0**3)
 
 
@@ -420,44 +420,52 @@ def derive_parameters(
     df = 1.2 * (fmax - fmin)
     cutoff = 5.0
 
-    # 仕様書A §5: d_min と res_harminv, res_mode (period あたりの格子数 -> FDTDX 向けに [px/um] へも換算)
+    # 仕様書A §5 & spv/run_sim.py:
+    # spv/run_sim.py では Meep の長さ単位 = 1 um であり、res_harminv / res_mode は既に [pixels/um] 単位。
+    # type 6 の微小ギャップ (gap_ratio * a = 9nm) は 4x4x4 サブピクセル平滑化で表現し、
+    # ベースグリッド解像度は spv/run_sim.py 既定値 (type 6: 55 / 80, type 3-5: 60 / 90) を基準とする。
     d_min = min_feature(c)
-    d_min_over_period = max(d_min / a, 1e-4)
-    res_floor_meep = math.ceil(12.0 * n_core * fmax)
+    res_floor = math.ceil(12.0 * n_core * fmax)
 
+    quality = c.get("quality", "standard")
     if "accuracy" in cfg and isinstance(cfg["accuracy"], dict):
         acc_coarse = float(cfg["accuracy"].get("coarse", 2.0))
         acc_fine = float(cfg["accuracy"].get("fine", 4.0))
-        res_harminv_meep = max(math.ceil(acc_coarse / d_min_over_period), res_floor_meep)
-        res_mode_meep = max(math.ceil(acc_fine / d_min_over_period), res_floor_meep)
     else:
-        quality = c.get("quality", "standard")
-        acc_coarse, acc_fine = (1.5, 3.0) if quality == "fast" else ((3.0, 5.0) if quality == "high" else (2.0, 4.0))
-        res_harminv_meep = max(math.ceil(acc_coarse / d_min_over_period), res_floor_meep)
-        res_mode_meep = max(math.ceil(acc_fine / d_min_over_period), res_floor_meep)
+        acc_coarse, acc_fine = (1.5, 3.0) if quality == "fast" else ((2.5, 4.5) if quality == "high" else (2.0, 4.0))
 
-    if res_harminv_meep > 120:
-        print(f"[警告] 導出された res_harminv={res_harminv_meep} が RES_MAX=120 を超えています。")
-    if res_mode_meep > 120:
-        print(f"[警告] 導出された res_mode={res_mode_meep} が RES_MAX=120 を超えています。")
+    if stype == 6:
+        # spv/run_sim.py L214-215: coarse=2 -> 55 px/um, fine=4 -> 80 px/um
+        res_harminv = max(int(round(27.5 * acc_coarse)), res_floor)
+        res_mode = max(int(round(20.0 * acc_fine)), res_floor)
+    elif stype in (3, 4, 5):
+        # spv/run_sim.py L284-285: coarse=2 -> 60 px/um, fine=4 -> 90 px/um
+        res_harminv = max(int(round(30.0 * acc_coarse)), res_floor)
+        res_mode = max(int(round(22.5 * acc_fine)), res_floor)
+    else:
+        res_harminv = max(int(round(25.0 * acc_coarse)), res_floor)
+        res_mode = max(int(round(20.0 * acc_fine)), res_floor)
 
-    # 仕様書B1 §5: dx = period / res_meep -> 1 um あたりの格子数は res_px_per_um = res_meep / period
-    res_harminv = int(round(res_harminv_meep / a))
-    res_mode = int(round(res_mode_meep / a))
+    res_harminv = min(res_harminv, 90)
+    res_mode = min(res_mode, 100)
 
     if "res_harminv" in cfg and cfg["res_harminv"] is not None:
         res_harminv = int(cfg["res_harminv"])
     if "res_mode" in cfg and cfg["res_mode"] is not None:
         res_mode = int(cfg["res_mode"])
 
-    # §5 dist_to_pml と pml_w (spv/run_sim.py & 仕様書A §5 準拠)
-    half_lam_period = 0.5 / fmin
-    legacy_z_dist = 0.55 if stype == 6 else 0.60
-    legacy_pml_w = 0.35 if stype == 6 else 0.10
+    res_harminv_meep = res_harminv
+    res_mode_meep = res_mode
 
-    dist_xy = half_lam_period
-    dist_z = max(half_lam_period, legacy_z_dist)
-    pml_w_base = max(half_lam_period, legacy_pml_w)
+    # §5 dist_to_pml と pml_w (spv/run_sim.py L225-230, L287-289 と完全一致)
+    if stype == 6:
+        dist_xy = 0.35
+        dist_z = 0.55
+        pml_w_base = 0.35
+    else:
+        dist_xy = 0.70
+        dist_z = 0.60
+        pml_w_base = 0.10
 
     lx_s, ly_s, lz_s = _compute_structure_bounding_box(c)
 
@@ -465,13 +473,14 @@ def derive_parameters(
         pml_cells = max(10, int(math.ceil(pml_w_base * res_um)))
         pml_w = pml_cells / float(res_um)
         if stype == 6:
-            sx = lx_s + 2.0 * dist_xy
-            sy = ly_s + 2.0 * dist_xy
-            sz = lz_s + 2.0 * dist_z
+            # spv/run_sim.py L228-230 + my_mp_setup.py L40-42: sx = xm + 2*pml_w
+            sx = lx_s + 2.0 * (dist_xy + pml_w)
+            sy = ly_s + 2.0 * (dist_xy + pml_w)
+            sz = lz_s + 2.0 * (dist_z + pml_w)
         else:
-            sx = lx_s + dist_xy
-            sy = ly_s + dist_xy
-            sz = lz_s + dist_z
+            sx = lx_s + dist_xy + 2.0 * pml_w
+            sy = ly_s + dist_xy + 2.0 * pml_w
+            sz = lz_s + dist_z + 2.0 * pml_w
         nx = max(16, int(round(sx * res_um)))
         ny = max(16, int(round(sy * res_um)))
         nz_full = max(16, int(round(sz * res_um)))
