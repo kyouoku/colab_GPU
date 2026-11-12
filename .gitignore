@@ -1,0 +1,18 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# Runtime / Simulation outputs
+spv_results/
+spv_colab_results/
+spv_validation/
+spv_colab/.runtime_cfg.json
+*.h5
+epchk*.png
+M(*.png
+harminv_*.png
+run_log.txt
+summary.csv
+best condition *.txt
