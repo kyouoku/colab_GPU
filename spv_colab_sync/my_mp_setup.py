@@ -166,7 +166,7 @@ class my_mp_setup:
                 return self.field_name_to_mp_field(preferred)
         return self.field_name_to_mp_field(fields[0])
 
-    def _build_decay_or_tmax_stop(self, mfield_list, pt0, tmax):
+    def _build_decay_or_tmax_stop(self, mfield_list, pt0, tmax, total_meep_t):
         if not self.use_decay_stop:
             return tmax
 
@@ -174,15 +174,11 @@ class my_mp_setup:
         decay_cond = mp.stop_when_fields_decayed(
             self.decay_dt, mp_c, pt0, self.decay_by
         )
-        src_end_time = [None]
 
         def _stop_cond(sim):
-            if src_end_time[0] is None:
-                src_end_time[0] = sim.sources_end_time()
             if decay_cond(sim):
                 return True
-            elapsed_after_src = sim.round_time() - src_end_time[0]
-            return elapsed_after_src >= tmax
+            return sim.round_time() >= total_meep_t
 
         return _stop_cond
 
@@ -401,7 +397,7 @@ class my_mp_setup:
             total_meep_t = (2.0 * self.cutoff_harminv / df) + tmax
             order.append(self._create_progress_step_func(total_meep_t))
 
-            stop_cond = self._build_decay_or_tmax_stop(mfield_list, mpos_list[0], tmax)
+            stop_cond = self._build_decay_or_tmax_stop(mfield_list, mpos_list[0], tmax, total_meep_t)
             t0_wall = time.time()
             sim.run(*order, until_after_sources=stop_cond)
             self.last_elapsed_sim_sec = time.time() - t0_wall
@@ -530,7 +526,7 @@ class my_mp_setup:
                 pos_list = self._normalize_positions(src_pos)
                 pt0 = mp.Vector3(self.period * pos_list[0][0], self.period * pos_list[0][1], self.period * pos_list[0][2])
 
-            stop_cond = self._build_decay_or_tmax_stop(self._normalize_fields(sfield), pt0, tmax)
+            stop_cond = self._build_decay_or_tmax_stop(self._normalize_fields(sfield), pt0, tmax, total_meep_t)
             t0_wall = time.time()
             sim.run(*run_args, until_after_sources=stop_cond)
             self.last_elapsed_sim_sec = time.time() - t0_wall
