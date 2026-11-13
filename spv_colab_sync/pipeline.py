@@ -124,27 +124,70 @@ def _build_mpirun_prefix(np_procs: int) -> List[str]:
     return prefix
 
 
-def _resolve_mpi_python() -> str:
+def _resolve_mpi_python(env: Optional[Dict[str, str]] = None) -> str:
     """condacolab 等で PyMeep が導入されている Python 実行ファイルを優先して選択する。"""
     candidates: List[str] = []
-    for cand in (shutil.which("python"), "/usr/local/bin/python", shutil.which("python3"), sys.executable):
-        if cand and cand not in candidates:
+    conda_prefix = os.environ.get("CONDA_PREFIX", "").strip()
+    raw_cands = [
+        os.path.join(conda_prefix, "bin", "python") if conda_prefix else None,
+        shutil.which("python"),
+        "/usr/local/bin/python",
+        "/usr/local/bin/python3",
+        shutil.which("python3"),
+        *sorted(glob.glob("/usr/local/envs/*/bin/python")),
+        *sorted(glob.glob("/opt/conda/envs/*/bin/python")),
+        "/opt/conda/bin/python",
+        sys.executable,
+    ]
+    for cand in raw_cands:
+        if cand and os.path.exists(cand) and cand not in candidates:
             candidates.append(cand)
 
+    errors: List[str] = []
     for py_exe in candidates:
         try:
             res = subprocess.run(
                 [py_exe, "-c", "import meep"],
                 capture_output=True,
                 text=True,
-                timeout=10,
+                timeout=15,
+                env=env,
                 check=False,
             )
             if res.returncode == 0:
                 return py_exe
-        except Exception:
-            continue
-    return sys.executable
+            err_msg = ((res.stderr or "") + " " + (res.stdout or "")).strip().splitlines()
+            errors.append(f"  - {py_exe}: {err_msg[-1] if err_msg else f'exit={res.returncode}'}")
+        except Exception as exc:
+            errors.append(f"  - {py_exe}: {exc}")
+
+    # 親プロセス側で meep が見えている場合、その site-packages を PYTHONPATH に補って再試行
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("meep")
+        if spec and spec.origin and env is not None:
+            meep_site = os.path.dirname(os.path.dirname(os.path.abspath(spec.origin)))
+            prev_pp = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = f"{prev_pp}{os.pathsep}{meep_site}" if prev_pp else meep_site
+            for py_exe in candidates:
+                res = subprocess.run(
+                    [py_exe, "-c", "import meep"],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    env=env,
+                    check=False,
+                )
+                if res.returncode == 0:
+                    return py_exe
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "MPI サブプロセスで `import meep` できる Python が見つかりませんでした。\n"
+        "セル 1（condacolab & PyMeep インストール）が正常に完了しているか確認してください。\n"
+        "確認した Python 候補:\n" + "\n".join(errors)
+    )
 
 
 def run_mpi_pipeline(
@@ -181,7 +224,7 @@ def run_mpi_pipeline(
     prev_pp = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{prev_pp}" if prev_pp else repo_root
 
-    py_exe = _resolve_mpi_python()
+    py_exe = _resolve_mpi_python(env=env)
     cmd = _build_mpirun_prefix(int(np_procs)) + [
         py_exe,
         "-u",
