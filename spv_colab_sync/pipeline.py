@@ -9,9 +9,10 @@ import glob
 import multiprocessing
 import os
 import platform
+import shutil
 import subprocess
 import sys
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 from . import config as cfg_mod
@@ -89,6 +90,63 @@ def collect_outputs(out_dir: str) -> Dict[str, Any]:
     }
 
 
+def _resolve_mpirun_executable() -> str:
+    for cand in ("/usr/local/bin/mpirun", shutil.which("mpirun"), "mpirun"):
+        if cand and os.path.exists(cand):
+            return cand
+    return shutil.which("mpirun") or "mpirun"
+
+
+def _build_mpirun_prefix(np_procs: int) -> List[str]:
+    """MPICH (Hydra) と OpenMPI の双方に対応する mpirun コマンド先頭部を構築する。"""
+    mpirun_bin = _resolve_mpirun_executable()
+    supports_allow_root = False
+    try:
+        res_ver = subprocess.run(
+            [mpirun_bin, "--version"], capture_output=True, text=True, timeout=5, check=False
+        )
+        ver_text = ((res_ver.stdout or "") + "\n" + (res_ver.stderr or "")).lower()
+        if "open mpi" in ver_text or "open-mpi" in ver_text:
+            supports_allow_root = True
+        elif "hydra" not in ver_text and "mpich" not in ver_text:
+            res_help = subprocess.run(
+                [mpirun_bin, "--help"], capture_output=True, text=True, timeout=5, check=False
+            )
+            help_text = (res_help.stdout or "") + "\n" + (res_help.stderr or "")
+            supports_allow_root = "--allow-run-as-root" in help_text
+    except Exception:
+        supports_allow_root = False
+
+    prefix = [mpirun_bin]
+    if supports_allow_root:
+        prefix.append("--allow-run-as-root")
+    prefix.extend(["-np", str(int(np_procs))])
+    return prefix
+
+
+def _resolve_mpi_python() -> str:
+    """condacolab 等で PyMeep が導入されている Python 実行ファイルを優先して選択する。"""
+    candidates: List[str] = []
+    for cand in (shutil.which("python"), "/usr/local/bin/python", shutil.which("python3"), sys.executable):
+        if cand and cand not in candidates:
+            candidates.append(cand)
+
+    for py_exe in candidates:
+        try:
+            res = subprocess.run(
+                [py_exe, "-c", "import meep"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if res.returncode == 0:
+                return py_exe
+        except Exception:
+            continue
+    return sys.executable
+
+
 def run_mpi_pipeline(
     cfg: Optional[Dict[str, Any]] = None,
     np_procs: Optional[int] = None,
@@ -123,12 +181,9 @@ def run_mpi_pipeline(
     prev_pp = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = f"{repo_root}{os.pathsep}{prev_pp}" if prev_pp else repo_root
 
-    cmd = [
-        "mpirun",
-        "--allow-run-as-root",
-        "-np",
-        str(int(np_procs)),
-        sys.executable,
+    py_exe = _resolve_mpi_python()
+    cmd = _build_mpirun_prefix(int(np_procs)) + [
+        py_exe,
         "-u",
         "-m",
         "spv_colab_sync.run_sim",
