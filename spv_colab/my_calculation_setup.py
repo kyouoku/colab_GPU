@@ -276,6 +276,16 @@ class my_mp_calc:
                     self.mfield_list,
                     self.sfield,
                 )
+            elif self.sim_setup_flag and self.flag == 2.1:
+                self.file_name_list = self.mpset.get_mode_fname(
+                    self.src_pos,
+                    self.sfield,
+                    self.fcen,
+                    self.df,
+                    self.tmax,
+                    self.pos_xyz,
+                    self.out_field_list,
+                )
         else:
             print('Error: set_structure needs two arguments at least')
         self.st_param = list(args)
@@ -357,15 +367,18 @@ class my_mp_calc:
         sim_condition = []
         is_multi_sfield = isinstance(self.sfield, (list, tuple, np.ndarray)) and len(self.sfield) > 1
         for fname in self.file_name_list:
-            temp = fname.split('_')
-            temp0 = temp[0].split(')')
-            ex = temp0[1]
-            ex_pos = temp0[0].split('(')[-1]
-            ex_x, ex_y, ex_z = ex_pos.split(' ')
-            sym = temp[1].split(' ')[-1].replace(')', '')
-            m_ex, m_pos = temp[3].replace(')', '').split('(')
-            m_x, m_y, m_z = m_pos.split(' ')
-            freq = temp[0].split('(')[1].split(' ')[0]
+            head_m = re.match(r"^H\(([^ ]+) [^ ]+ [^ ]+ \(([^)]+)\)([^)]+)\)", fname)
+            sym_m = re.search(r" ([+\-o]{3})\)_\[", fname)
+            tail_m = re.search(r"_([A-Za-z0-9]+)\(([^)]+)\)$", fname)
+            if not (head_m and sym_m and tail_m):
+                raise ValueError(f"Harminv ファイル名のパースに失敗しました: {fname}")
+
+            freq = head_m.group(1)
+            ex_x, ex_y, ex_z = head_m.group(2).split()
+            ex = head_m.group(3)
+            sym = sym_m.group(1)
+            m_ex = tail_m.group(1)
+            m_x, m_y, m_z = tail_m.group(2).split()
             # 同時励起時は監視成分と同じ成分も励起されているため ex に m_ex を対応付ける
             if is_multi_sfield:
                 ex = m_ex

@@ -1,6 +1,10 @@
+import glob
 import json
 import math
 import os
+import shutil
+import subprocess
+import sys
 import numpy as np
 
 # ==============================================================================
@@ -341,4 +345,111 @@ if os.path.exists(_RUNTIME_CFG_PATH):
         cfg.update(_loaded)
     except Exception:
         pass
+
+
+def resolve_mpirun_executable():
+    """環境内の mpirun 実行ファイルパスを解決する。"""
+    for cand in ('/usr/local/bin/mpirun', shutil.which('mpirun'), 'mpirun'):
+        if cand and os.path.exists(cand):
+            return cand
+    return shutil.which('mpirun') or 'mpirun'
+
+
+def build_mpirun_prefix(np_procs):
+    """MPICH (Hydra) と OpenMPI の双方に対応する mpirun コマンド先頭部を構築する。"""
+    mpirun_bin = resolve_mpirun_executable()
+    supports_allow_root = False
+    try:
+        res_ver = subprocess.run(
+            [mpirun_bin, '--version'], capture_output=True, text=True, timeout=5, check=False
+        )
+        ver_text = ((res_ver.stdout or '') + '\n' + (res_ver.stderr or '')).lower()
+        if 'open mpi' in ver_text or 'open-mpi' in ver_text:
+            supports_allow_root = True
+        elif 'hydra' not in ver_text and 'mpich' not in ver_text:
+            res_help = subprocess.run(
+                [mpirun_bin, '--help'], capture_output=True, text=True, timeout=5, check=False
+            )
+            help_text = (res_help.stdout or '') + '\n' + (res_help.stderr or '')
+            supports_allow_root = '--allow-run-as-root' in help_text
+    except Exception:
+        supports_allow_root = False
+
+    prefix = [mpirun_bin]
+    if supports_allow_root:
+        prefix.append('--allow-run-as-root')
+    prefix.extend(['-np', str(int(np_procs))])
+    return prefix
+
+
+def resolve_mpi_python(env=None):
+    """condacolab 等で PyMeep が導入されている Python 実行ファイルを優先して選択する。"""
+    candidates = []
+    conda_prefix = os.environ.get('CONDA_PREFIX', '').strip()
+    raw_cands = [
+        os.path.join(conda_prefix, 'bin', 'python') if conda_prefix else None,
+        shutil.which('python'),
+        '/usr/local/bin/python',
+        '/usr/local/bin/python3',
+        shutil.which('python3'),
+        *sorted(glob.glob('/usr/local/envs/*/bin/python')),
+        *sorted(glob.glob('/opt/conda/envs/*/bin/python')),
+        '/opt/conda/bin/python',
+        sys.executable,
+    ]
+    for cand in raw_cands:
+        if cand and os.path.exists(cand) and cand not in candidates:
+            candidates.append(cand)
+
+    errors = []
+    for py_exe in candidates:
+        try:
+            res = subprocess.run(
+                [py_exe, '-c', 'import meep'],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env=env,
+                check=False,
+            )
+            if res.returncode == 0:
+                return py_exe
+            err_msg = ((res.stderr or '') + ' ' + (res.stdout or '')).strip().splitlines()
+            errors.append(f'  - {py_exe}: {err_msg[-1] if err_msg else f"exit={res.returncode}"}')
+        except Exception as exc:
+            errors.append(f'  - {py_exe}: {exc}')
+
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec('meep')
+        if spec and spec.origin and env is not None:
+            meep_site = os.path.dirname(os.path.dirname(os.path.abspath(spec.origin)))
+            prev_pp = env.get('PYTHONPATH', '')
+            env['PYTHONPATH'] = f'{prev_pp}{os.pathsep}{meep_site}' if prev_pp else meep_site
+            for py_exe in candidates:
+                res = subprocess.run(
+                    [py_exe, '-c', 'import meep'],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    env=env,
+                    check=False,
+                )
+                if res.returncode == 0:
+                    return py_exe
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        'MPI サブプロセスで `import meep` できる Python が見つかりませんでした。\n'
+        'condacolab & PyMeep インストールセルが正常に完了しているか確認してください。\n'
+        '確認した Python 候補:\n' + '\n'.join(errors)
+    )
+
+
+def build_mpirun_cmd(np_procs, script_args, env=None):
+    """MPICH / OpenMPI 自動判定と Meep 対応 Python を組み合わせて mpirun コマンドを組み立てる。"""
+    py_exe = resolve_mpi_python(env=env)
+    return build_mpirun_prefix(np_procs) + [py_exe, *list(script_args)]
+
 

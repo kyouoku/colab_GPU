@@ -507,6 +507,11 @@ def derive_parameters(
         else:
             parities = [p_map[pz]]
 
+    # type=3 (microdisk) / type=4 (rough_microdisk) は下部犠牲層・基板により z 非対称のため pz=0 を強制
+    if stype in (3, 4) and any(p != 0 for p in parities):
+        print(f"[注意] structure_type={stype} は z 非対称構造のため parities={parities} -> [0] に自動調整します。")
+        parities = [0]
+
     # GPUメモリ上限チェック (仕様書B1 §5)
     max_allowed_gb = float(backend.get("max_gpu_mem_frac", 0.9)) * gpu_mem_gb
     dtype_str = backend.get("dtype", "float32")
@@ -527,11 +532,11 @@ def derive_parameters(
     sp_harminv, pml_w_harminv, grid_harminv = _calc_cell_and_grid(res_harminv, pz_check)
     sp_mode, pml_w_mode, grid_mode = _calc_cell_and_grid(res_mode, pz_check)
 
-    # パリティ毎の監視・励起成分 (仕様書A §5: 偶 ex,ey,hz / 奇 hx,hy,ez)
+    # パリティ毎の監視・励起成分 (仕様書A §5: 偶 ex,ey,hz / 奇 hx,hy,ez / 無対称 全6成分)
     parity_components: Dict[int, Dict[str, List[str]]] = {
         +1: {"src_comps": ["Ex", "Ey", "Hz"], "mon_comps": ["Ex", "Ey", "Hz"]},
         -1: {"src_comps": ["Hx", "Hy", "Ez"], "mon_comps": ["Hx", "Hy", "Ez"]},
-        0: {"src_comps": ["Ex", "Ey", "Ez", "Hz"], "mon_comps": ["Ex", "Ey", "Ez", "Hz"]},
+        0: {"src_comps": ["Ex", "Ey", "Ez", "Hx", "Hy", "Hz"], "mon_comps": ["Ex", "Ey", "Ez", "Hx", "Hy", "Hz"]},
     }
 
     src_positions, mon_positions = _generate_default_sources_and_monitors(c)

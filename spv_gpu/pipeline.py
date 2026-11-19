@@ -271,6 +271,7 @@ def run_spv_pipeline(
     # STEP 1 & STEP 2: 広帯域 Harminv 探索 + クラスタリング・自動モード選出
     # =========================================================================
     coarse_all_dfs: List[pd.DataFrame] = []
+    step1_elapsed_by_pz: Dict[int, float] = {}
 
     if run_mode in ("ALL", "HARMINV"):
         for pz in parities:
@@ -341,7 +342,9 @@ def run_spv_pipeline(
                 )
 
             w_done = (float(derived["res_harminv"]) ** 4) * float(derived["T_MAX_harminv"])
-            estimator.finish_stage(f"STEP1_pz{pz}", w_done, time.perf_counter() - t0_st)
+            pz_elapsed = time.perf_counter() - t0_st
+            step1_elapsed_by_pz[pz] = pz_elapsed
+            estimator.finish_stage(f"STEP1_pz{pz}", w_done, pz_elapsed)
             _log(f"Progress {estimator.format_eta()}")
 
         coarse_merged_df = (
@@ -407,13 +410,31 @@ def run_spv_pipeline(
             indent=2,
         )
 
+    def _parity_char(pz_val: Any) -> str:
+        try:
+            pv = int(pz_val)
+        except Exception:
+            pv = 0
+        return "+" if pv == 1 else ("-" if pv == -1 else "o")
+
     if run_mode == "HARMINV" or selected_coarse_df.empty:
+        harminv_summary_df = selected_coarse_df.copy()
+        if not harminv_summary_df.empty:
+            if "pz" not in harminv_summary_df.columns:
+                harminv_summary_df["pz"] = 0
+            harminv_summary_df["parity"] = harminv_summary_df["pz"].map(_parity_char)
+            harminv_summary_df["res"] = int(derived["res_harminv"])
+            harminv_summary_df["elapsed_sec"] = harminv_summary_df["pz"].map(
+                lambda pv: round(step1_elapsed_by_pz.get(int(pv), 0.0), 2)
+            )
+            if "profile_png" not in harminv_summary_df.columns:
+                harminv_summary_df["profile_png"] = ""
         summary_csv = os.path.join(base_out_dir, "summary.csv")
-        selected_coarse_df.to_csv(summary_csv, index=False)
+        harminv_summary_df.to_csv(summary_csv, index=False)
         _log(f"Pipeline finished (HARMINV mode). Summary written to {summary_csv}")
         return {
             "output_dir": base_out_dir,
-            "summary_df": selected_coarse_df,
+            "summary_df": harminv_summary_df,
             "coarse_df": coarse_merged_df,
             "epchk_pngs": epchk_png_paths,
             "harminv_pngs": harminv_plot_paths,
@@ -432,6 +453,7 @@ def run_spv_pipeline(
         if modes_in_pz.empty:
             continue
 
+        t_pz_refine_start = time.perf_counter()
         p_label = parity_label(pz)
         _log(f"--- [STEP 2.5 / 3] High-Res Mode Refinement & Profile ({p_label}, res={derived['res_mode']}) ---")
 
@@ -563,12 +585,22 @@ def run_spv_pipeline(
             sim_res_dft = sim_res_ref
 
         # 各モードの断面プロファイル画像を保存
+        pz_total_elapsed = round(
+            step1_elapsed_by_pz.get(pz, 0.0) + (time.perf_counter() - t_pz_refine_start), 2
+        )
         for local_i, (_, row) in enumerate(sel_ref_df.iterrows()):
             row_dict = row.to_dict()
             f_val = float(row_dict["freq"])
             q_val = float(row_dict["Q"])
             sym_s = str(row_dict.get("sym", p_label))
             mode_global_idx = len(refined_rows)
+
+            row_dict["pz"] = int(pz)
+            row_dict["parity"] = _parity_char(pz)
+            row_dict["res"] = int(derived["res_mode"])
+            row_dict["elapsed_sec"] = pz_total_elapsed
+            if "profile_png" not in row_dict:
+                row_dict["profile_png"] = ""
 
             if local_i in sim_res_dft.dft_slices:
                 png_name = f"mode_{mode_global_idx}_f{f_val:.5f}_{sym_s}_Dden_Hden.png"
