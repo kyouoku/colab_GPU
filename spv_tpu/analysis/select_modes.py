@@ -31,11 +31,12 @@ def cluster_and_select_modes(
     n_modes_select: int = 3,
     min_detections: int = 2,
     rel_freq_tol_floor: float = 2e-3,
+    rel_freq_tol_cap: float = 5e-3,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     全モニタ点・全成分・各パリティの Harminv 検出結果 `harminv_df` から
-    近接周波数 `|Δf| < max(f / (2*Q), f * rel_freq_tol_floor)` でモードをクラスタリングし、
-    Q中央値と最大振幅で上位 `n_modes_select` 個の共振モードを自動選出する。
+    高Q優先でシードを選び、近接周波数 `|Δf| <= min(max(f/(2Q), f*floor), f*cap)` で
+    モードをクラスタリングし、Q中央値と最大振幅で上位 `n_modes_select` 個の共振モードを自動選出する。
     """
     if harminv_df is None or harminv_df.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -47,18 +48,25 @@ def cluster_and_select_modes(
     cluster_records: List[Dict[str, Any]] = []
 
     for pz_val, grp in df.groupby("pz"):
-        grp_sorted = grp.sort_values(by="freq", ascending=True).reset_index(drop=True)
+        # 高Q・大振幅のピークから優先的にクラスタを形成し、低Q過渡雑音が高Qモードを飲み込むのを防ぐ
+        grp_sorted = grp.sort_values(by=["Q", "|A|"], ascending=[False, False]).reset_index(drop=True)
         used = np.zeros(len(grp_sorted), dtype=bool)
+        freqs_arr = grp_sorted["freq"].to_numpy(dtype=np.float64)
+        qs_arr = grp_sorted["Q"].to_numpy(dtype=np.float64)
 
         for i in range(len(grp_sorted)):
             if used[i]:
                 continue
-            f_seed = float(grp_sorted.loc[i, "freq"])
-            q_seed = max(float(grp_sorted.loc[i, "Q"]), 20.0)
-            tol = max(f_seed / (2.0 * q_seed), f_seed * rel_freq_tol_floor)
+            f_seed = float(freqs_arr[i])
+            q_seed = max(float(qs_arr[i]), 20.0)
+            tol = min(
+                max(f_seed / (2.0 * q_seed), f_seed * rel_freq_tol_floor),
+                f_seed * rel_freq_tol_cap,
+            )
 
-            diffs = np.abs(grp_sorted["freq"].to_numpy(dtype=np.float64) - f_seed)
-            members_mask = (~used) & (diffs <= tol)
+            diffs = np.abs(freqs_arr - f_seed)
+            q_compatible = (qs_arr >= 0.2 * q_seed) if q_seed >= 100.0 else np.ones(len(grp_sorted), dtype=bool)
+            members_mask = (~used) & (diffs <= tol) & q_compatible
             used[members_mask] = True
             members = grp_sorted[members_mask]
 

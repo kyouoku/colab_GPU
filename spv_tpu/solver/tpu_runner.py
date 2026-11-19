@@ -457,7 +457,7 @@ def _run_fdtdx_fallback_simulation(
     t_src_end = 2.0 * cutoff / max(df, 1e-9)
     t0_pulse = 0.5 * t_src_end
     pulse_w = 1.0 / max(df, 1e-9)
-    total_steps_max = max(100, int(math.ceil(t_max / dt_meep)))
+    total_steps_max = max(100, int(math.ceil(t_max / dt_meep - 1e-9)))
     stride = max(1, int(stride))
     chunk_steps = max(stride * 10, (int(chunk_steps) // stride) * stride)
     samples_per_chunk = chunk_steps // stride
@@ -586,12 +586,13 @@ def _run_fdtdx_fallback_simulation(
     )
 
     all_traces: List[np.ndarray] = []
+    chunk_times: List[float] = []
     peak_energy = 0.0
+    ringdown_peak_energy = 0.0
     final_energy = 0.0
     stopped_early = False
     current_step = 0
     t_start_wall = time.perf_counter()
-    jit_compile_sec = 0.0
 
     while current_step < total_steps_max:
         t0 = time.perf_counter()
@@ -599,27 +600,38 @@ def _run_fdtdx_fallback_simulation(
         traces_np = np.asarray(traces_dev, dtype=np.float32)
         del traces_dev
         t1 = time.perf_counter()
-        if current_step == 0:
-            jit_compile_sec = t1 - t0
+        chunk_times.append(t1 - t0)
         all_traces.append(traces_np)
         current_step += chunk_steps
         t_cur_meep = current_step * dt_meep
         tail_len = max(1, samples_per_chunk // 4)
+        tail_start_t = (current_step - tail_len * stride) * dt_meep
         chunk_energy = float(np.mean(traces_np[-tail_len:] ** 2))
         if not np.isfinite(chunk_energy):
             raise RuntimeError("FDTD simulation produced NaN/Inf field values.")
         peak_energy = max(peak_energy, chunk_energy)
+        if tail_start_t > t_src_end:
+            ringdown_peak_energy = max(ringdown_peak_energy, chunk_energy)
         final_energy = chunk_energy
         if progress_callback is not None:
             progress_callback(current_step, total_steps_max, t_cur_meep, final_energy)
-        if t_cur_meep > t_src_end + 80.0 / max(fcen, 0.1) and peak_energy > 0.0:
-            if final_energy < peak_energy * decay_threshold:
+        min_ringdown_time = t_src_end + 150.0 / max(fcen, 0.1)
+        if t_cur_meep > min_ringdown_time and ringdown_peak_energy > 0.0 and decay_threshold > 0.0:
+            if final_energy < ringdown_peak_energy * decay_threshold:
                 stopped_early = True
                 break
 
     wall_time_sec = time.perf_counter() - t_start_wall
-    eff_sim_sec = max(wall_time_sec - jit_compile_sec, 1e-6)
-    mcells_per_sec = (float(nx) * float(ny) * float(nz) * float(current_step) / 1e6) / eff_sim_sec
+    if len(chunk_times) >= 2:
+        steady_sec = max(sum(chunk_times[1:]), 1e-6)
+        steady_steps = (len(chunk_times) - 1) * chunk_steps
+        mean_steady_chunk = steady_sec / float(len(chunk_times) - 1)
+        jit_compile_sec = max(0.0, chunk_times[0] - mean_steady_chunk)
+        mcells_per_sec = (float(nx) * float(ny) * float(nz) * float(steady_steps) / 1e6) / steady_sec
+    else:
+        jit_compile_sec = chunk_times[0] if chunk_times else 0.0
+        eff_sim_sec = max(wall_time_sec, 1e-6)
+        mcells_per_sec = (float(nx) * float(ny) * float(nz) * float(current_step) / 1e6) / eff_sim_sec
     full_traces = np.concatenate(all_traces, axis=0)
     dt_rec = float(stride) * dt_meep
     time_array = (np.arange(len(full_traces), dtype=np.float64) + 1.0) * dt_rec
@@ -1235,7 +1247,7 @@ def run_tpu_simulation(
     t0_pulse = 0.5 * t_src_end
     pulse_w = 1.0 / max(df, 1e-9)
 
-    total_steps_max = max(100, int(math.ceil(t_max / dt_meep)))
+    total_steps_max = max(100, int(math.ceil(t_max / dt_meep - 1e-9)))
     stride = max(1, int(stride))
     chunk_steps = max(stride * 10, (int(chunk_steps) // stride) * stride)
     samples_per_chunk = chunk_steps // stride
@@ -1429,13 +1441,14 @@ def run_tpu_simulation(
     )
 
     all_traces: List[np.ndarray] = []
+    chunk_times: List[float] = []
     peak_energy = 0.0
+    ringdown_peak_energy = 0.0
     final_energy = 0.0
     stopped_early = False
     current_step = 0
 
     t_start_wall = time.perf_counter()
-    jit_compile_sec = 0.0
 
     try:
         while current_step < total_steps_max:
@@ -1455,33 +1468,42 @@ def run_tpu_simulation(
             del traces_dev
             t_c1 = time.perf_counter()
 
-            if current_step == 0:
-                jit_compile_sec = t_c1 - t_c0
-
+            chunk_times.append(t_c1 - t_c0)
             all_traces.append(traces_np)
             current_step += chunk_steps
             t_cur_meep = current_step * dt_meep
 
             tail_len = max(1, samples_per_chunk // 4)
+            tail_start_t = (current_step - tail_len * stride) * dt_meep
             chunk_energy = float(np.mean(traces_np[-tail_len:] ** 2))
             if not np.isfinite(chunk_energy) or not np.all(np.isfinite(traces_np)):
                 raise RuntimeError("FDTD simulation produced NaN/Inf field values.")
             if chunk_energy > peak_energy:
                 peak_energy = chunk_energy
+            if tail_start_t > t_src_end and chunk_energy > ringdown_peak_energy:
+                ringdown_peak_energy = chunk_energy
             final_energy = chunk_energy
 
             if progress_callback is not None:
                 progress_callback(current_step, total_steps_max, t_cur_meep, final_energy)
 
-            min_ringdown_time = t_src_end + 80.0 / max(fcen, 0.1)
-            if t_cur_meep > min_ringdown_time and peak_energy > 0.0:
-                if final_energy < peak_energy * decay_threshold:
+            min_ringdown_time = t_src_end + 150.0 / max(fcen, 0.1)
+            if t_cur_meep > min_ringdown_time and ringdown_peak_energy > 0.0 and decay_threshold > 0.0:
+                if final_energy < ringdown_peak_energy * decay_threshold:
                     stopped_early = True
                     break
 
         wall_time_sec = time.perf_counter() - t_start_wall
-        eff_sim_sec = max(wall_time_sec - jit_compile_sec, 1e-6)
-        mcells_per_sec = (float(nx) * float(ny) * float(nz) * float(current_step) / 1e6) / eff_sim_sec
+        if len(chunk_times) >= 2:
+            steady_sec = max(sum(chunk_times[1:]), 1e-6)
+            steady_steps = (len(chunk_times) - 1) * chunk_steps
+            mean_steady_chunk = steady_sec / float(len(chunk_times) - 1)
+            jit_compile_sec = max(0.0, chunk_times[0] - mean_steady_chunk)
+            mcells_per_sec = (float(nx) * float(ny) * float(nz) * float(steady_steps) / 1e6) / steady_sec
+        else:
+            jit_compile_sec = chunk_times[0] if chunk_times else 0.0
+            eff_sim_sec = max(wall_time_sec, 1e-6)
+            mcells_per_sec = (float(nx) * float(ny) * float(nz) * float(current_step) / 1e6) / eff_sim_sec
 
         full_traces = np.concatenate(all_traces, axis=0)
         dt_rec = float(stride) * dt_meep

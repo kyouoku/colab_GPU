@@ -153,8 +153,8 @@ def validate_mirror_bc_and_cpml() -> Dict[str, Any]:
         layout="zyx",
     )
     pmc_z_prop_amp = float(np.max(np.abs(res_pmc.monitor_traces[:, 1, 0])))
-    pmc_coupled = pmc_z_prop_amp > 1e-2
-    cpml_stable = (
+    pmc_coupled = bool(pmc_z_prop_amp > 1e-2)
+    cpml_stable = bool(
         np.all(np.isfinite(res_pmc.monitor_traces))
         and res_pmc.final_energy < max(res_pmc.peak_energy * 1e-2, 1e-8)
     )
@@ -182,7 +182,7 @@ def validate_mirror_bc_and_cpml() -> Dict[str, Any]:
         layout="zyx",
     )
     pec_z_prop_amp = float(np.max(np.abs(res_pec.monitor_traces[:, 0, 0])))
-    pec_coupled = pec_z_prop_amp > 1e-2 and np.all(np.isfinite(res_pec.monitor_traces))
+    pec_coupled = bool(pec_z_prop_amp > 1e-2 and np.all(np.isfinite(res_pec.monitor_traces)))
 
     return {
         "test": "Mirror_BC_and_CFS_CPML",
@@ -199,11 +199,16 @@ def validate_v2_2d_phc(out_dir: str = "./spv_validation") -> Dict[str, Any]:
     """V2: 2D PhC 欠陥共振器 (`structure_type = 0`) の共振周波数・Q値検証。"""
     cfg, backend = get_default_config()
     cfg["structure_type"] = 0
+    cfg["structure"] = {}
+    cfg["geom"] = {}
     cfg["period"] = 0.42
     cfg["f_range"] = (0.55, 0.75)
+    cfg.pop("accuracy", None)
     cfg["quality"] = "fast"
     cfg["run_mode"] = "HARMINV"
+    cfg["parities"] = ["+"]
     cfg["symmetry"] = {"px": 0, "py": 0, "pz": 1}
+    cfg["Q_expected"] = 2e3
     cfg["output_dir"] = out_dir
 
     res_dict = run_spv_pipeline(cfg, backend=backend, date_str="v2_2d_phc")
@@ -225,9 +230,12 @@ def validate_v3_type6_bowtie(out_dir: str = "./spv_validation") -> Dict[str, Any
     """V3: `structure_type = 6` (Singular Bowtie PhC, `pz = +1` / `-1`) の偶・奇両パリティ検証。"""
     cfg, backend = get_default_config()
     cfg["structure_type"] = 6
+    cfg.pop("accuracy", None)
     cfg["quality"] = "fast"
     cfg["run_mode"] = "HARMINV"
+    cfg["parities"] = ["+", "-"]
     cfg["symmetry"] = {"px": 0, "py": 0, "pz": "auto"}
+    cfg["Q_expected"] = 3e3
     cfg["output_dir"] = out_dir
 
     res_dict = run_spv_pipeline(cfg, backend=backend, date_str="v3_type6_bowtie")
@@ -244,16 +252,19 @@ def validate_v3_type6_bowtie(out_dir: str = "./spv_validation") -> Dict[str, Any
 
 def validate_v5_speed_benchmark(
     grid_sizes: List[Tuple[int, int, int]] | None = None,
-    steps: int = 1000,
+    steps: int = 2000,
     pml_mode: str = "cpml",
 ) -> Dict[str, Any]:
     """
     V5: TPU 速度ベンチマーク (`Mcells*step/s`、初回 JIT コンパイル時間、ウォームキャッシュ再実行、
     推定 HBM 帯域幅 [GB/s]、Colab CPU Meep 比高速化倍率を計測)。
+    2 チャンク構成 (`chunk_steps = steps // 2`) で実行し、チャンク0とチャンク1の差分から
+    正味の JIT コンパイル時間と定常スループットを厳密分離して計測する。
     """
     if grid_sizes is None:
         grid_sizes = [(128, 128, 64), (256, 256, 64), (512, 480, 64)]
 
+    chunk_steps = max(100, int(steps) // 2)
     meep_cpu_baseline_mcells = 3.0
     records = []
 
@@ -266,7 +277,7 @@ def validate_v5_speed_benchmark(
         dt_meep = (0.99 / math.sqrt(3.0)) * dx
         t_max = steps * dt_meep
 
-        # Cold JIT + run
+        # Cold JIT + run (2 chunks)
         sim_cold = run_tpu_simulation(
             eps_grid=eps_dummy,
             coords=(xs, ys, zs),
@@ -282,14 +293,14 @@ def validate_v5_speed_benchmark(
             pml_cells=10,
             pz=1,
             stride=4,
-            chunk_steps=steps,
+            chunk_steps=chunk_steps,
             decay_threshold=0.0,
             pml_mode=pml_mode,
             keep_jit_cache=True,
             layout="zyx",
         )
 
-        # Warm re-run (same shape -> cached XLA executable)
+        # Warm re-run (same shape -> cached XLA executable, 2 chunks)
         sim_warm = run_tpu_simulation(
             eps_grid=eps_dummy,
             coords=(xs, ys, zs),
@@ -305,7 +316,7 @@ def validate_v5_speed_benchmark(
             pml_cells=10,
             pz=1,
             stride=4,
-            chunk_steps=steps,
+            chunk_steps=chunk_steps,
             decay_threshold=0.0,
             pml_mode=pml_mode,
             keep_jit_cache=True,
